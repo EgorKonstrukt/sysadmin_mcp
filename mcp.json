@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "sysadmin": {
+      "command": "python",
+      "args": [
+        "C:\\PATH\\TO\\sysadmin_mcp\\server.py"
+      ],
+      "env": {}
+    }
+  }
+}
