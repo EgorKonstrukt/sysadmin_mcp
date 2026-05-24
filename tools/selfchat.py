@@ -248,19 +248,42 @@ class SelfChatTools:
         self._tool_registry = registry
 
     def _get_loaded_model(self, base_url: str) -> str | None:
-        try:
-            req = urllib.request.Request(
-                f"{base_url.rstrip('/')}/v1/models",
-                headers={"Authorization": "Bearer lm-studio"},
-                method="GET"
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                models = data.get("data", [])
-                if models:
-                    return models[0]["id"]
-        except Exception:
-            pass
+        candidate_urls = [base_url.rstrip("/")]
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.port != 1234:
+            candidate_urls.append(f"{parsed.scheme}://{parsed.hostname}:1234")
+        if parsed.port != 11434:
+            candidate_urls.append(f"{parsed.scheme}://{parsed.hostname}:11434")
+
+        for url in candidate_urls:
+            try:
+                req = urllib.request.Request(
+                    f"{url}/v1/models",
+                    headers={"Authorization": "Bearer lm-studio"},
+                    method="GET"
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    models = data.get("data", [])
+                    if models:
+                        return models[0]["id"]
+            except Exception:
+                pass
+
+        for url in candidate_urls:
+            try:
+                req = urllib.request.Request(
+                    f"{url}/api/tags",
+                    method="GET"
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    models = data.get("models", [])
+                    if models:
+                        return models[0].get("name") or models[0].get("id")
+            except Exception:
+                pass
+
         return None
 
     def _call_api_blocking(self, base_url: str, payload: dict) -> dict:
@@ -466,9 +489,7 @@ class SelfChatTools:
     async def _create(self, args: dict) -> dict:
         base_url = args.get("lmstudio_url", "http://localhost:1234")
         system_prompt = args.get("system_prompt", "")
-        model = args.get("model") or self._get_loaded_model(base_url)
-        if not model:
-            return {"error": "Could not detect loaded model. Specify 'model' explicitly or ensure LM Studio server is running."}
+        model = args.get("model") or self._get_loaded_model(base_url) or "local-model"
 
         allowed_tools = args.get("tools", [])
         max_tool_iterations = int(args.get("max_tool_iterations", 10))
