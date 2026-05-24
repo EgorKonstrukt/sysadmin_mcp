@@ -109,6 +109,16 @@ NET_TOOLS = [
 
 IS_WIN = sys.platform == "win32"
 
+def _decode_cmd_output(raw: bytes) -> str:
+    if not IS_WIN:
+        return raw.decode("utf-8", errors="replace")
+    for enc in ["utf-8", "cp866", "cp1251", "latin-1"]:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
 class NetworkTools:
     async def _connections(self, args: dict) -> dict:
         state_f = args.get("state_filter", "").upper()
@@ -147,6 +157,18 @@ class NetworkTools:
         ports.sort(key=lambda x: x["port"] or 0)
         return {"ports": ports, "count": len(ports)}
 
+    def _run_subprocess(self, cmd: list, timeout: int) -> tuple[bool, str]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+            output = _decode_cmd_output(result.stdout) + _decode_cmd_output(result.stderr)
+            return result.returncode == 0, output
+        except subprocess.TimeoutExpired:
+            return False, f"Command timed out after {timeout}s"
+        except FileNotFoundError:
+            return False, f"Command not found: {cmd[0]}"
+        except Exception as e:
+            return False, str(e)
+
     async def _ping(self, args: dict) -> dict:
         host = args["host"]
         count = args.get("count", 4)
@@ -155,14 +177,11 @@ class NetworkTools:
             cmd = ["ping", "-n", str(count), "-w", str(timeout * 1000), host]
         else:
             cmd = ["ping", "-c", str(count), "-W", str(timeout), host]
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * count + 5)
-            )
-            return {"host": host, "output": result.stdout + result.stderr, "success": result.returncode == 0}
-        except Exception as e:
-            return {"host": host, "error": str(e)}
+        loop = asyncio.get_event_loop()
+        success, output = await loop.run_in_executor(
+            None, lambda: self._run_subprocess(cmd, timeout * count + 5)
+        )
+        return {"host": host, "output": output, "success": success}
 
     async def _dns_lookup(self, args: dict) -> dict:
         host = args["host"]
@@ -185,8 +204,9 @@ class NetworkTools:
         timeout = args.get("timeout", 15)
         max_b = args.get("max_response_bytes", 65536)
         verify = args.get("verify_ssl", True)
-        ctx = None if verify else ssl.create_default_context()
-        if not verify and ctx:
+        ctx = None
+        if not verify:
+            ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         try:
@@ -203,7 +223,8 @@ class NetworkTools:
                         "truncated": False,
                         "url": resp.url
                     }
-            return await asyncio.get_event_loop().run_in_executor(None, do_req)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, do_req)
         except urllib.error.HTTPError as e:
             raw = e.read(max_b)
             return {"status": e.code, "reason": e.reason, "body": raw.decode("utf-8", errors="replace"), "error": True}
@@ -238,20 +259,16 @@ class NetworkTools:
             cmd = ["tracert", "-h", str(max_hops), "-w", "1000", host]
         else:
             cmd = ["traceroute", "-m", str(max_hops), host]
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            )
-            return {"host": host, "output": result.stdout + result.stderr, "success": result.returncode == 0}
-        except Exception as e:
-            return {"host": host, "error": str(e)}
+        loop = asyncio.get_event_loop()
+        success, output = await loop.run_in_executor(
+            None, lambda: self._run_subprocess(cmd, timeout)
+        )
+        return {"host": host, "output": output, "success": success}
 
     async def _port_scan(self, args: dict) -> dict:
         host = args["host"]
         ports = args["ports"]
         timeout = args.get("timeout", 1.0)
-        results = []
         async def check(port):
             try:
                 _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
@@ -263,8 +280,7 @@ class NetworkTools:
                 return {"port": port, "open": True}
             except Exception:
                 return {"port": port, "open": False}
-        tasks = [check(p) for p in ports]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*[check(p) for p in ports])
         return {"host": host, "results": sorted(results, key=lambda x: x["port"]), "open_count": sum(1 for r in results if r["open"])}
 
     def get_handlers(self):

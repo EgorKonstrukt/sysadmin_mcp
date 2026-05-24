@@ -16,6 +16,7 @@ from tools.network import NetworkTools
 from tools.archive import ArchiveTools
 from tools.registry import RegistryTools
 from tools.sysinfo import SysInfoTools
+from tools.selfchat import SelfChatTools
 
 VERSION = "1.0.0"
 
@@ -27,6 +28,7 @@ _tools = {}
 
 def init_tools():
     global _tools
+    selfchat = SelfChatTools()
     instances = [
         ScreenTools(),
         InputTools(),
@@ -39,10 +41,16 @@ def init_tools():
         ArchiveTools(),
         RegistryTools(),
         SysInfoTools(),
+        selfchat,
     ]
     for inst in instances:
         for name, handler in inst.get_handlers().items():
             _tools[name] = handler
+    selfchat.set_tool_registry({
+        name: handler
+        for name, handler in _tools.items()
+        if not name.startswith("selfchat_")
+    })
 
 def get_tool_definitions():
     from tools.screen import SCREEN_TOOLS
@@ -56,7 +64,10 @@ def get_tool_definitions():
     from tools.archive import ARCHIVE_TOOLS
     from tools.registry import REGISTRY_TOOLS
     from tools.sysinfo import SYSINFO_TOOLS
-    all_defs = SCREEN_TOOLS + INPUT_TOOLS + FS_TOOLS + PROCESS_TOOLS + SHELL_TOOLS + CLIPBOARD_TOOLS + MEMORY_TOOLS + NET_TOOLS + ARCHIVE_TOOLS + REGISTRY_TOOLS + SYSINFO_TOOLS
+    from tools.selfchat import SELFCHAT_TOOLS
+    all_defs = (SCREEN_TOOLS + INPUT_TOOLS + FS_TOOLS + PROCESS_TOOLS + SHELL_TOOLS +
+                CLIPBOARD_TOOLS + MEMORY_TOOLS + NET_TOOLS + ARCHIVE_TOOLS + REGISTRY_TOOLS +
+                SYSINFO_TOOLS + SELFCHAT_TOOLS)
     return [Tool(name=d["name"], description=d["description"], inputSchema=d["schema"]) for d in all_defs]
 
 @app.list_tools()
@@ -69,7 +80,9 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
     try:
         result = await _tools[name](arguments)
-        return [TextContent(type="text", text=json.dumps(result) if not isinstance(result, str) else result)]
+        if isinstance(result, str):
+            return [TextContent(type="text", text=result)]
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
     except Exception as e:
         return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
