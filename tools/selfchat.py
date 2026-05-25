@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import debug as _debug
 
 SELFCHAT_TOOLS = [
     {
@@ -37,10 +38,10 @@ SELFCHAT_TOOLS = [
                 "tools": {
                     "type": "array",
                     "description": (
-                        "List of MCP tool names to make available to this agent. "
-                        "The agent can call them by writing TOOL_CALL: tool_name {json_args} on its own line. "
-                        "Results are injected back into the conversation automatically. "
-                        "Example: ['system_stats', 'process_list', 'net_connections']"
+                        "JSON array of MCP tool name strings to give this agent access to. "
+                        "Must be a JSON array of strings, not a comma-separated string. "
+                        "Example: [\"shell_run\", \"fs_list\"]. "
+                        "Omit or pass [] for a session without tools."
                     ),
                     "items": {"type": "string"},
                     "default": []
@@ -286,7 +287,7 @@ class SelfChatTools:
 
         return None
 
-    def _call_api_blocking(self, base_url: str, payload: dict) -> dict:
+    def _call_api_blocking(self, base_url: str, payload: dict, token_callback=None) -> dict:
         parsed = urllib.parse.urlparse(base_url.rstrip("/"))
         host = parsed.hostname
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -339,6 +340,8 @@ class SelfChatTools:
                 content = delta.get("content")
                 if content:
                     chunks.append(content)
+                    if token_callback:
+                        token_callback(content)
                 fr = event.get("choices", [{}])[0].get("finish_reason")
                 if fr:
                     finish_reason = fr
@@ -357,9 +360,11 @@ class SelfChatTools:
         except Exception as e:
             return {"error": str(e)}
 
-    async def _call_api(self, base_url: str, payload: dict) -> dict:
+    async def _call_api(self, base_url: str, payload: dict, token_callback=None) -> dict:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_executor, self._call_api_blocking, base_url, payload)
+        return await loop.run_in_executor(
+            _executor, self._call_api_blocking, base_url, payload, token_callback
+        )
 
     def _parse_tool_call(self, text: str) -> tuple[str, dict] | None:
         for line in text.strip().splitlines():
@@ -408,6 +413,14 @@ class SelfChatTools:
         finish_reason = "unknown"
         tool_calls_made = []
 
+        term = _debug.DebugTerminal(f"[selfchat {session_id}]")
+        if _debug.DEBUG:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(_executor, term.open)
+        term.writeln(f"=== session {session_id}  model: {session['model']} ===")
+        term.writeln(f"USER: {message}")
+        term.writeln()
+
         for iteration in range(max_iterations + 1):
             async with session["lock"]:
                 payload = {
@@ -417,9 +430,20 @@ class SelfChatTools:
                     "max_tokens": max_tokens,
                 }
 
-            result = await self._call_api(session["base_url"], payload)
+            term.write(f"AGENT [iter {iteration}]: ")
+
+            def on_token(tok: str, _term=term):
+                _term.write(tok)
+
+            result = await self._call_api(
+                session["base_url"], payload,
+                token_callback=on_token if _debug.DEBUG else None
+            )
+            term.writeln()
 
             if "error" in result:
+                term.writeln(f"ERROR: {result['error']}")
+                term.close()
                 async with session["lock"]:
                     session["messages"].pop()
                 job["status"] = "error"
@@ -431,6 +455,8 @@ class SelfChatTools:
                 reply = choice["message"].get("content") or ""
                 finish_reason = choice.get("finish_reason", "unknown")
             except (KeyError, IndexError, TypeError) as e:
+                term.writeln(f"ERROR: bad API response: {e}")
+                term.close()
                 async with session["lock"]:
                     session["messages"].pop()
                 job["status"] = "error"
@@ -438,6 +464,8 @@ class SelfChatTools:
                 return
 
             if not reply:
+                term.writeln("ERROR: empty content from model.")
+                term.close()
                 async with session["lock"]:
                     session["messages"].pop()
                 job["status"] = "error"
@@ -448,7 +476,11 @@ class SelfChatTools:
 
             if parsed is not None and iteration < max_iterations:
                 tool_name, tool_args = parsed
+                term.writeln(f"TOOL_CALL: {tool_name} {tool_args}")
                 tool_result = await self._dispatch_tool(tool_name, tool_args, allowed_tools)
+                result_preview = tool_result if len(tool_result) <= 500 else tool_result[:500] + "...(truncated)"
+                term.writeln(f"TOOL_RESULT: {result_preview}")
+                term.writeln()
 
                 tool_calls_made.append({"tool": tool_name, "args": tool_args, "result": tool_result})
 
@@ -467,13 +499,14 @@ class SelfChatTools:
             final_reply = reply
 
         async with session["lock"]:
-            if not tool_calls_made:
-                session["messages"].append({"role": "assistant", "content": final_reply})
-            else:
-                session["messages"].append({"role": "assistant", "content": final_reply})
+            session["messages"].append({"role": "assistant", "content": final_reply})
             session["turn_count"] += 1
             turn = session["turn_count"]
             total = len(session["messages"])
+
+        term.writeln()
+        term.writeln(f"=== done  turn={turn}  finish={finish_reason} ===")
+        term.close()
 
         job["status"] = "done"
         job["result"] = {
@@ -492,6 +525,13 @@ class SelfChatTools:
         model = args.get("model") or self._get_loaded_model(base_url) or "local-model"
 
         allowed_tools = args.get("tools", [])
+        if isinstance(allowed_tools, str):
+            try:
+                allowed_tools = json.loads(allowed_tools)
+            except json.JSONDecodeError:
+                allowed_tools = [t.strip() for t in allowed_tools.replace(",", " ").split() if t.strip()]
+        if not isinstance(allowed_tools, list):
+            allowed_tools = []
         max_tool_iterations = int(args.get("max_tool_iterations", 10))
 
         unavailable = [t for t in allowed_tools if t not in self._tool_registry]

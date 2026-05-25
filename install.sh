@@ -6,6 +6,7 @@ VENV="$DIR/.venv"
 PYTHON="$VENV/bin/python"
 MCP_DIR="$HOME/.lmstudio"
 MCP_JSON="$MCP_DIR/mcp.json"
+SERVER="$DIR/server.py"
 
 echo "=== SysAdmin MCP Installer ==="
 echo "Install dir: $DIR"
@@ -25,31 +26,35 @@ echo "[2/4] Installing dependencies..."
 echo "[3/4] Writing mcp.json..."
 mkdir -p "$MCP_DIR"
 
-SERVER="$DIR/server.py"
+ENTRY=$(printf '{"command":"%s","args":["%s"],"env":{}}' "$PYTHON" "$SERVER")
 
-if [ -f "$MCP_JSON" ]; then
-    echo "[WARN] $MCP_JSON already exists."
-    echo "       Merge the following block into it manually under \"mcpServers\":"
-    echo
-    echo "  \"sysadmin\": {"
-    echo "    \"command\": \"$PYTHON\","
-    echo "    \"args\": [\"$SERVER\"],"
-    echo "    \"env\": {}"
-    echo "  }"
-    echo
-else
-    cat > "$MCP_JSON" <<JSON
-{
-  "mcpServers": {
-    "sysadmin": {
-      "command": "$PYTHON",
-      "args": ["$SERVER"],
-      "env": {}
-    }
-  }
+if [ ! -f "$MCP_JSON" ]; then
+    printf '{\n  "mcpServers": {\n    "sysadmin": %s\n  }\n}\n' "$ENTRY" > "$MCP_JSON"
+    echo "Created $MCP_JSON"
+elif command -v python3 &>/dev/null; then
+    python3 - "$MCP_JSON" "$PYTHON" "$SERVER" << 'PYEOF'
+import sys, json
+
+path, python, server = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+data.setdefault("mcpServers", {})["sysadmin"] = {
+    "command": python,
+    "args": [server],
+    "env": {}
 }
-JSON
-    echo "Written to $MCP_JSON"
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+
+print("Merged into", path)
+PYEOF
+else
+    echo "[ERROR] Cannot merge: python3 not available for JSON editing."
+    exit 1
 fi
 
 echo

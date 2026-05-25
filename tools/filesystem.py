@@ -253,6 +253,52 @@ FS_TOOLS = [
             },
             "required": ["path", "pattern", "replacement"]
         }
+    },
+    {
+        "name": "fs_str_replace",
+        "description": "Replace a unique string in a file with new text. old_str must appear EXACTLY ONCE in the file — use this guarantee to make precise edits without touching other occurrences. Fails with an error if old_str is not found or appears more than once. Prefer this over fs_replace_text for code editing because it forces exactness. Always view the file first so old_str matches the raw content character-for-character.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_str": {"type": "string", "description": "Exact string to find. Must be unique in the file."},
+                "new_str": {"type": "string", "description": "String to replace it with. Empty string deletes old_str."},
+                "encoding": {"type": "string", "default": "utf-8"}
+            },
+            "required": ["path", "old_str", "new_str"]
+        }
+    },
+    {
+        "name": "fs_view",
+        "description": "View a file with numbered lines and smart truncation for large files, or list a directory up to 2 levels deep. For files: returns lines with N\\t prefix so line numbers are always visible. Truncates the middle of very large files and shows beginning + end. Use view_range to see a specific slice. This is the preferred tool for reading code before editing.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File or directory path."},
+                "view_range": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "Optional [start_line, end_line] range (1-based, inclusive). Use -1 as end_line to read to end of file."
+                },
+                "encoding": {"type": "string", "default": "utf-8"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "fs_create",
+        "description": "Create a new file with given content. Fails if the path already exists — use fs_write or fs_str_replace to edit existing files. Creates parent directories automatically.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "encoding": {"type": "string", "default": "utf-8"}
+            },
+            "required": ["path", "content"]
+        }
     }
 ]
 
@@ -593,7 +639,6 @@ class FilesystemTools:
         replacement = args["replacement"]
         count = args.get("count", 0)
         flag_names = args.get("flags", [])
-
         flag_map = {
             "IGNORECASE": re.IGNORECASE,
             "MULTILINE": re.MULTILINE,
@@ -602,7 +647,6 @@ class FilesystemTools:
         combined_flags = 0
         for fn in flag_names:
             combined_flags |= flag_map.get(fn, 0)
-
         try:
             with open(p, "r", encoding=enc, errors="replace") as f:
                 content = f.read()
@@ -615,6 +659,81 @@ class FilesystemTools:
             return {"path": str(p), "replacements": n, "success": True}
         except re.error as ex:
             return {"error": f"Invalid regex: {ex}"}
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    async def _str_replace(self, args: dict) -> dict:
+        p = Path(args["path"])
+        if not p.exists():
+            return {"error": f"File not found: {p}"}
+        enc = args.get("encoding", "utf-8")
+        old = args["old_str"]
+        new = args["new_str"]
+        try:
+            with open(p, "r", encoding=enc, errors="replace") as f:
+                content = f.read()
+            count = content.count(old)
+            if count == 0:
+                return {"error": f"old_str not found in file: {p}"}
+            if count > 1:
+                return {"error": f"old_str appears {count} times in file — it must be unique. Add more surrounding context to make it unique."}
+            with open(p, "w", encoding=enc) as f:
+                f.write(content.replace(old, new, 1))
+            return {"path": str(p), "success": True}
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    async def _view(self, args: dict) -> dict:
+        p = Path(args["path"])
+        if not p.exists():
+            return {"error": f"Path not found: {p}"}
+        if p.is_dir():
+            lines = []
+            for item in sorted(p.rglob("*"), key=lambda x: x.parts):
+                depth = len(item.relative_to(p).parts) - 1
+                if depth > 1:
+                    continue
+                prefix = "  " * depth
+                lines.append(f"{prefix}{item.name}{'/' if item.is_dir() else ''}")
+            return {"path": str(p), "type": "directory", "listing": "\n".join(lines)}
+        enc = args.get("encoding", "utf-8")
+        view_range = args.get("view_range")
+        max_lines_full = 16000
+        truncate_head = 120
+        truncate_tail = 40
+        try:
+            with open(p, "r", encoding=enc, errors="replace") as f:
+                all_lines = f.readlines()
+            total = len(all_lines)
+            if view_range:
+                s = max(1, view_range[0]) - 1
+                e = total if view_range[1] == -1 else min(view_range[1], total)
+                slice_ = all_lines[s:e]
+                numbered = "".join(f"    {s + i + 1}\t{line}" for i, line in enumerate(slice_))
+                return {"path": str(p), "total_lines": total, "content": numbered, "range": [s + 1, s + len(slice_)]}
+            if total <= max_lines_full:
+                numbered = "".join(f"    {i + 1}\t{line}" for i, line in enumerate(all_lines))
+                return {"path": str(p), "total_lines": total, "content": numbered}
+            head = all_lines[:truncate_head]
+            tail = all_lines[total - truncate_tail:]
+            head_str = "".join(f"    {i + 1}\t{line}" for i, line in enumerate(head))
+            tail_str = "".join(f"    {total - truncate_tail + i + 1}\t{line}" for i, line in enumerate(tail))
+            skipped = total - truncate_head - truncate_tail
+            middle_note = f"\n< truncated {skipped} lines >\n\n"
+            return {"path": str(p), "total_lines": total, "content": head_str + middle_note + tail_str, "truncated": True}
+        except Exception as ex:
+            return {"error": str(ex)}
+
+    async def _create(self, args: dict) -> dict:
+        p = Path(args["path"])
+        if p.exists():
+            return {"error": f"File already exists: {p}. Use fs_write to overwrite or fs_str_replace to edit."}
+        enc = args.get("encoding", "utf-8")
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w", encoding=enc) as f:
+                f.write(args["content"])
+            return {"success": True, "path": str(p), "size": p.stat().st_size}
         except Exception as ex:
             return {"error": str(ex)}
 
@@ -637,4 +756,7 @@ class FilesystemTools:
             "fs_delete_lines": self._delete_lines,
             "fs_patch": self._patch,
             "fs_regex_replace": self._regex_replace,
+            "fs_str_replace": self._str_replace,
+            "fs_view": self._view,
+            "fs_create": self._create,
         }

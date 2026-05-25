@@ -17,8 +17,13 @@ from tools.archive import ArchiveTools
 from tools.registry import RegistryTools
 from tools.sysinfo import SysInfoTools
 from tools.selfchat import SelfChatTools
+import debug as _debug_module
 
-VERSION = "1.0.0"
+if "--debug" in sys.argv:
+    _debug_module.set_debug(True)
+    sys.argv.remove("--debug")
+
+VERSION = "1.3.0"
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
