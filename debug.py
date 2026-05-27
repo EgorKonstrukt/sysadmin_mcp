@@ -6,7 +6,7 @@ import tempfile
 import socket
 import subprocess
 
-DEBUG: bool = True
+DEBUG: bool = False
 
 
 def set_debug(value: bool):
